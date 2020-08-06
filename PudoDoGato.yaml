@@ -1,0 +1,571 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Template that deploy EC2 infraestructure.'
+
+Resources:
+
+  # INICIO # Cria os Security Groups
+  RDSSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: 'RDS Security Group'
+      GroupDescription: 'Security Group to RDS Instance traffic.'
+      VpcId: !Ref VPC
+
+  EC2SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: 'EC2 Security Group'
+      GroupDescription: 'Security Group to EC2 Instance traffic.'
+      VpcId: !Ref VPC
+
+  ELBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: 'ELB Security Group'
+      GroupDescription: 'Security Group to ELB traffic.'
+      VpcId: !Ref VPC
+  # FIM # Cria os Security Groups
+
+  # INICIO # Cria as regras do Security Group
+  EC2InboundRule1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref ELBSecurityGroup
+      Description: 'Allow HTTP access from ELB'
+
+  EC2ELBInboundRule1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ELBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: '0.0.0.0/0'
+      Description: 'Allow HTTP access from any origin over IPv4'
+
+  RDSInboundRule1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RDSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref EC2SecurityGroup
+      Description: 'Allow MySQL connection from EC2'
+
+  # FIM # Cria as regras do Security Group 
+
+  # INICIO # Cria as Policies e Roles
+  EC2Role:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+
+  EC2InstanceProfile: 
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      Path: "/"
+      Roles: 
+        - 
+          Ref: "EC2Role"
+  # FIM # Cria as Policies e Roles
+  
+  # INICIO # Cria o Load Balancer, Listeners e o Target Group
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "lb-semana-cloud"
+      Subnets: 
+        - !Ref SubnetAPublic
+        - !Ref SubnetBPublic
+      SecurityGroups:
+        - !Ref ELBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: "lb-semana-cloud"
+
+  LoadBalancerListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+      - TargetGroupArn: !Ref LoadBalancerTargetGroup
+        Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+          
+  LoadBalancerTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      VpcId: !Ref VPC
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: '/'
+      HealthCheckPort: '80'
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 25
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+      - Key: 'deregistration_delay.timeout_seconds'
+        Value: '30'
+      Targets:
+      - Id: !Ref EC2Instance1
+        Port: 80
+      - Id: !Ref EC2Instance2
+        Port: 80
+      Tags:
+      - Key: Name
+        Value: "tg-semana-cloud"
+  # FIM # Cria o Load Balancer, Listeners e o Target Group
+
+  # INICIO # Criando instancias EC2
+  EC2Instance1:
+    Type: AWS::EC2::Instance
+    DependsOn: DBInstance
+    Properties:
+      ImageId: ami-00068cd7555f543d5
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref "EC2InstanceProfile" # Vincula a Role
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetAPublic
+          GroupSet:
+            - !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: Instance1
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install httpd -y
+          sudo systemctl start httpd.service
+          sudo systemctl enable httpd.service
+          sudo yum install php php-mysql php-common mariadb.x86_64 -y
+          sudo systemctl restart httpd.service
+          sudo usermod -a -G apache ec2-user
+          sudo wget http://pages.cloudtreinamentos.com/aws/arquivos/gato.zip
+          sudo unzip -o gato.zip -d /var/www/html/
+          sudo mysql -u admin -pSenha123456 -h ${DBInstance.Endpoint.Address} dados < /var/www/html/sql/addressbook.sql
+          sed -i "s,Secret access key,${CFNKeys.SecretAccessKey}," /var/www/html/s3-conf.php
+          sed -i "s/Access key ID/${CFNKeys}/" /var/www/html/s3-conf.php
+          sed -i "s/NOME DO BUCKET/${Bucket}/" /var/www/html/s3-conf.php
+          sed -i "s/http:\/\/pages.cloudtreinamentos.com\/aws\/arquivos/https:\/\/${Bucket.DomainName}/" /var/www/html/s3-conf.php
+          sed -i "s/RDS_URL=''/RDS_URL='${DBInstance.Endpoint.Address}'/" /var/www/html/rds.conf.php
+          sudo chown -R ec2-user:apache /var/www
+          chmod 2775 /var/www && find /var/www -type d -exec sudo chmod 2775 {} \;
+          find /var/www -type f -exec sudo chmod 0664 {} \;
+  EC2Instance2:
+    Type: AWS::EC2::Instance
+    DependsOn: DBInstance
+    Properties:
+      ImageId: ami-00068cd7555f543d5
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref "EC2InstanceProfile" # Vincula a Role
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetBPublic
+          GroupSet:
+            - !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: Instance2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install httpd -y
+          sudo systemctl start httpd.service
+          sudo systemctl enable httpd.service
+          sudo yum install php php-mysql php-common mariadb.x86_64 -y
+          sudo systemctl restart httpd.service
+          sudo usermod -a -G apache ec2-user
+          sudo wget http://pages.cloudtreinamentos.com/aws/arquivos/gato.zip
+          sudo unzip -o gato.zip -d /var/www/html/
+          sudo mysql -u admin -pSenha123456 -h ${DBInstance.Endpoint.Address} dados < /var/www/html/sql/addressbook.sql
+          sed -i "s,Secret access key,${CFNKeys.SecretAccessKey}," /var/www/html/s3-conf.php
+          sed -i "s/Access key ID/${CFNKeys}/" /var/www/html/s3-conf.php
+          sed -i "s/NOME DO BUCKET/${Bucket}/" /var/www/html/s3-conf.php
+          sed -i "s/http:\/\/pages.cloudtreinamentos.com\/aws\/arquivos/https:\/\/${Bucket.DomainName}/" /var/www/html/s3-conf.php
+          sed -i "s/RDS_URL=''/RDS_URL='${DBInstance.Endpoint.Address}'/" /var/www/html/rds.conf.php
+          sudo chown -R ec2-user:apache /var/www
+          chmod 2775 /var/www && find /var/www -type d -exec sudo chmod 2775 {} \;
+          find /var/www -type f -exec sudo chmod 0664 {} \;
+  # FIM # Criando instancias EC2
+
+  # INICIO # Criando usuário IAM
+  CFNAdmin:
+    Type: AWS::IAM::User
+    Properties:
+      LoginProfile:
+        Password: ej3h128d3j21f
+  CFNAdminGroup:
+    Type: AWS::IAM::Group
+  Admins:
+    Type: AWS::IAM::UserToGroupAddition
+    Properties:
+      GroupName: !Ref 'CFNAdminGroup'
+      Users: [!Ref 'CFNAdmin']
+  CFNAdminPolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CFNAdmins
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Action: ['s3:*']
+          Resource: '*'
+      Groups: [!Ref 'CFNAdminGroup']
+  CFNKeys:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref 'CFNAdmin'
+  # FIM # Criando usuário IAM
+
+  # INICIO # Criando bucket no S3
+  Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Ref 'AWS::NoValue'
+
+  BucketPolicyPublic:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Principal: '*'
+          Action: 's3:GetObject'
+          Effect: Allow
+          Resource: !Sub '${Bucket.Arn}/*'
+  # FIM # Criando bucket no S3
+
+  # INICIO # Criando Banco de Dados
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: !Ref 'AWS::StackName'
+      SubnetIds: 
+        - !Ref SubnetAPublic
+        - !Ref SubnetBPublic
+
+  DBInstance:
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      AllocatedStorage: 5
+      DBInstanceClass: db.t2.micro
+      DBName: dados
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: mysql
+      EngineVersion: 5.7.30
+      MasterUsername: admin
+      MasterUserPassword: Senha123456
+      MultiAZ: 'false'
+      StorageType: gp2
+      VPCSecurityGroups:
+      - !Ref RDSSecurityGroup
+  # FIM # Criando Banco de Dados
+
+  # INICIO # Criando VPC e Subnets
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: !Sub '10.11.0.0/16'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+      - Key: Name
+        Value: !Sub '10.11.0.0/16'
+  VPCCidrBlock:
+    Type: 'AWS::EC2::VPCCidrBlock'
+    Properties:
+      AmazonProvidedIpv6CidrBlock: true
+      VpcId: !Ref VPC
+  InternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Sub '10.11.0.0/16'
+  EgressOnlyInternetGateway:
+    Type: 'AWS::EC2::EgressOnlyInternetGateway'
+    Properties:
+      VpcId: !Ref VPC
+  VPCGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  SubnetAPublic:
+    DependsOn: VPCCidrBlock
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Sub '10.11.0.0/20'
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt 'VPC.Ipv6CidrBlocks'], 4, 64]]
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'A public'
+      - Key: Reach
+        Value: public
+  SubnetAPrivate:
+    DependsOn: VPCCidrBlock
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AssignIpv6AddressOnCreation: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Sub '10.11.16.0/20'
+      Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt 'VPC.Ipv6CidrBlocks'], 4, 64]]
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'A private'
+      - Key: Reach
+        Value: private
+  SubnetBPublic:
+    DependsOn: VPCCidrBlock
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Sub '10.11.32.0/20'
+      Ipv6CidrBlock: !Select [2, !Cidr [!Select [0, !GetAtt 'VPC.Ipv6CidrBlocks'], 4, 64]]
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'B public'
+      - Key: Reach
+        Value: public
+  SubnetBPrivate:
+    DependsOn: VPCCidrBlock
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      AssignIpv6AddressOnCreation: false
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Sub '10.11.48.0/20'
+      Ipv6CidrBlock: !Select [3, !Cidr [!Select [0, !GetAtt 'VPC.Ipv6CidrBlocks'], 4, 64]]
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'B private'
+      - Key: Reach
+        Value: private
+  RouteTablePublic:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'A Public'
+  RouteTablePrivate: 
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'A Private'
+  RouteTableBPublic:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'B Public'
+  RouteTableBPrivate:
+    Type: 'AWS::EC2::RouteTable'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: 'B Private'
+  RouteTableAssociationAPublic:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAPublic
+      RouteTableId: !Ref RouteTablePublic
+  RouteTableAssociationAPrivate:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAPrivate
+      RouteTableId: !Ref RouteTablePrivate
+  RouteTableAssociationBPublic:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetBPublic
+      RouteTableId: !Ref RouteTableBPublic
+  RouteTableAssociationBPrivate:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      SubnetId: !Ref SubnetBPrivate
+      RouteTableId: !Ref RouteTableBPrivate
+  RouteTablePublicInternetRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+  RouteTablePublicAInternetRouteIPv6:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      DestinationIpv6CidrBlock: '::/0'
+      GatewayId: !Ref InternetGateway
+  RouteTablePrivateAInternetRouteIPv6:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref RouteTablePrivate
+      DestinationIpv6CidrBlock: '::/0'
+      EgressOnlyInternetGatewayId: !Ref EgressOnlyInternetGateway
+  RouteTablePublicBInternetRoute:
+    Type: 'AWS::EC2::Route'
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTableBPublic
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+  RouteTablePublicBInternetRouteIPv6:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref RouteTableBPublic
+      DestinationIpv6CidrBlock: '::/0'
+      GatewayId: !Ref InternetGateway
+  RouteTablePrivateBInternetRouteIPv6:
+    Type: 'AWS::EC2::Route'
+    Properties:
+      RouteTableId: !Ref RouteTableBPrivate
+      DestinationIpv6CidrBlock: '::/0'
+      EgressOnlyInternetGatewayId: !Ref EgressOnlyInternetGateway
+  NetworkAclPublic:
+    Type: 'AWS::EC2::NetworkAcl'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: Public
+  NetworkAclPrivate:
+    Type: 'AWS::EC2::NetworkAcl'
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: Private
+  SubnetNetworkAclAssociationAPublic:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAPublic
+      NetworkAclId: !Ref NetworkAclPublic
+  SubnetNetworkAclAssociationAPrivate:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetAPrivate
+      NetworkAclId: !Ref NetworkAclPrivate
+  SubnetNetworkAclAssociationBPublic:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetBPublic
+      NetworkAclId: !Ref NetworkAclPublic
+  SubnetNetworkAclAssociationBPrivate:
+    Type: 'AWS::EC2::SubnetNetworkAclAssociation'
+    Properties:
+      SubnetId: !Ref SubnetBPrivate
+      NetworkAclId: !Ref NetworkAclPrivate
+  NetworkAclEntryInPublicAllowAll:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPublic
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: '0.0.0.0/0'
+  NetworkAclEntryInPublicAllowAllIPv6:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPublic
+      RuleNumber: 98
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      Ipv6CidrBlock: '::/0'
+  NetworkAclEntryOutPublicAllowAll:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPublic
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: '0.0.0.0/0'
+  NetworkAclEntryOutPublicAllowAllIPv6:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPublic
+      RuleNumber: 98
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      Ipv6CidrBlock: '::/0'
+  NetworkAclEntryInPrivateAllowAll:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPrivate
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: '0.0.0.0/0'
+  NetworkAclEntryInPrivateAllowAllIPv6:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPrivate
+      RuleNumber: 98
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      Ipv6CidrBlock: '::/0'
+  NetworkAclEntryOutPrivateAllowAll:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPrivate
+      RuleNumber: 99
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: '0.0.0.0/0'
+  NetworkAclEntryOutPrivateAllowAllIPv6:
+    Type: 'AWS::EC2::NetworkAclEntry'
+    Properties:
+      NetworkAclId: !Ref NetworkAclPrivate
+      RuleNumber: 98
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      Ipv6CidrBlock: '::/0'
+  # FIM # Criando VPC e Subnets
+
+Outputs:
+  LoadBalancerDNS:
+    Description: The URL for loadbalancer
+    Value: !Join ['', ['http://', !GetAtt [LoadBalancer, DNSName]]]
